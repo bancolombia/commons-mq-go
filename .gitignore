@@ -1,0 +1,28 @@
+# Go build outputs
+*.exe
+*.exe~
+*.test
+*.out
+
+# Binaries
+bin/
+
+# Test coverage profiles
+coverage*.out
+merged-coverage.out
+
+# Module download cache (keep go.sum, not the cache itself)
+# go.sum is intentionally committed
+
+# Editor artifacts
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*.tmp
+.vscode/
+.idea/
+
+# Logs
+*.log
+
