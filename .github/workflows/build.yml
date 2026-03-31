@@ -38,31 +38,53 @@ jobs:
         if: github.event_name == 'pull_request' || github.event_name == 'pull_request_target'
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Set up NodeJS
         if: github.ref == 'refs/heads/main'
         uses: actions/setup-node@v4
         with:
           node-version-file: '.nvmrc'
+
       - name: Set up Semantic Release
         if: github.ref == 'refs/heads/main'
         run: npm -g install @semantic-release/git semantic-release@23.0.0
+
       - name: Semantic Release
         if: github.ref == 'refs/heads/main'
         run: npx semantic-release@23.0.0
         env:
           GITHUB_TOKEN: ${{ steps.generate_token.outputs.token }}
+
+      - name: Download and install IBM MQ redistributable client manually
+        run: |
+          # Create installation directory
+          mkdir -p /opt/mqm
+          # Download and extract the client (example version 9.3.0.0)
+          curl -sL 'https://public.dhe.ibm.com/ibmdl/export/pub/software/websphere/messaging/mqdev/redist/9.3.0.0-IBM-MQC-Redist-LinuxX64.tar.gz' | tar xz -C /opt/mqm
+          # Set necessary environment variable for libraries
+          echo "LD_LIBRARY_PATH=/opt/mqm/lib64" >> $GITHUB_ENV
+          # Add MQ bin to PATH to use commands like dspmqver
+          echo "/opt/mqm/bin" >> $GITHUB_ENV
+
+      - name: Verify MQ installation using dspmqver
+        run: dspmqver
+
       - name: Setup Go 1.25.x
         uses: actions/setup-go@v5
         with:
           # Semantic version range syntax or exact version of Go
           go-version: '1.25.x'
+
       - name: Install dependencies
         run: go mod download
+
       - name: Build
         run: go build -v ./...
+
       - name: Go Vet
         run: |
           go vet ./...
+
       - name: Test and generate coverage
         run: go test -race -covermode=atomic -coverprofile=coverage.out ./...
 
