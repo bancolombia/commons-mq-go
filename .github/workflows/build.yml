@@ -30,6 +30,7 @@ jobs:
         if: github.ref == 'refs/heads/main'
         with:
           token: ${{ steps.generate_token.outputs.token }}
+          fetch-depth: 0
       - uses: actions/checkout@v4
         if: github.ref != 'refs/heads/main'
 
@@ -95,10 +96,9 @@ jobs:
 #          files: ./coverage.out
 
       - name: Analyze with SonarQube
-        uses: SonarSource/sonarqube-scan-action@v7.0.0 # Use the official action
+        uses: SonarSource/sonarqube-scan-action@v6 # Use the official action
         env:
           SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
-          # SONAR_HOST_URL: ${{ secrets.SONAR_HOST_URL }} # Uncomment if using SonarQube Server
         with:
           # Project metadata can be defined here or in a sonar-project.properties file
           args: >
