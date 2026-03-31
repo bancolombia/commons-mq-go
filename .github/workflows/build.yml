@@ -105,8 +105,8 @@ jobs:
             -Dsonar.projectKey=bancolombia_commons-mq-go
             -Dsonar.organization=grupo-bancolombia
             -Dsonar.sources=.
-            -Dsonar.coverage.exclusions=**/*_test.go
-            -Dsonar.exclusions=**/*_test.go
+            -Dsonar.coverage.exclusions=**/*_test.go,**/examples/*.go
+            -Dsonar.exclusions=**/*_test.go,**/examples/*.go
             -Dsonar.tests=.
             -Dsonar.test.inclusions=**/*_test.go
             -Dsonar.go.coverage.reportPaths=coverage.out
