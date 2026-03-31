@@ -64,7 +64,7 @@ jobs:
           # Set necessary environment variable for libraries
           echo "LD_LIBRARY_PATH=/opt/mqm/lib64" >> $GITHUB_ENV
           # Add MQ bin to PATH to use commands like dspmqver
-          echo "/opt/mqm/bin" >> $GITHUB_ENV
+          echo "/opt/mqm/bin" >> $GITHUB_PATH
 
       - name: Verify MQ installation using dspmqver
         run: dspmqver
