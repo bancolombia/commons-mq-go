@@ -1,6 +1,8 @@
-# commons-mq-go
+# commons-mq-go (alpha)
 
 Go equivalent of the [`commons-jms`](https://github.com/bancolombia/commons-jms) Java library — a high-level IBM MQ client for Go applications.
+
+**DISCLAIMER**: this is a non-production-quality alpha release
 
 ## Features
 
@@ -213,12 +215,12 @@ if !status.Healthy {
 
 ## Configuration
 
-See [Configuration reference](https://bancolombia.github.io/commons-mq-go/docs/go-03-configuration) for all `Config` fields and defaults.
+See [Configuration reference](https://github.com/bancolombia/commons-mq-go/blob/main/docs/go-03-configuration.md) for all `Config` fields and defaults.
 
 ## Documentation
 
-Full documentation: <https://bancolombia.github.io/commons-mq-go/docs>
+Full documentation: <https://github.com/bancolombia/commons-mq-go/tree/main/docs>
 
 ## License
 
-This project is licensed under the MIT License — see [LICENSE](../LICENSE) for details.
+This project is licensed under the MIT License — see [LICENSE](./LICENSE) for details.
