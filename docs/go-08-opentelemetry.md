@@ -62,7 +62,9 @@ When `Telemetry` is `nil` (the default), all instrumentation is no-op — zero o
 | `messaging.publish.duration` | Histogram | ms | Put call latency |
 | `messaging.receive.duration` | Histogram | ms | Handler dispatch latency |
 | `messaging.connection.active` | Gauge | connections | Live MQ connections |
-| `messaging.errors.total` | Counter | errors | Errors labeled by `error.type` |
+| `messaging.errors.total` | Counter | errors | Errors labeled by `error.type`: `connection_failed`, `put_failed`, `handler_failed` |
+
+When a message handler returns an error or panics, the consumer span is marked with `Error` status and the exception is recorded on it, and `messaging.errors.total{error.type=handler_failed}` is incremented.
 
 ## Context propagation
 

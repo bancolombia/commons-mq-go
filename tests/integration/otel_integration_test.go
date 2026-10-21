@@ -16,6 +16,7 @@ import (
 	mqotel "github.com/bancolombia/commons-mq-go/otel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"go.opentelemetry.io/otel/codes"
 	"go.opentelemetry.io/otel/propagation"
 	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	"go.opentelemetry.io/otel/sdk/metric/metricdata"
@@ -337,6 +338,66 @@ func TestOTelIntegration_ErrorsTotal(t *testing.T) {
 	require.NotNil(t, ctr, "messaging.errors.total counter must exist")
 	require.NotEmpty(t, ctr.DataPoints)
 	assert.GreaterOrEqual(t, ctr.DataPoints[0].Value, int64(1))
+}
+
+// TestOTelIntegration_HandlerErrorSpanAndMetric verifies that a handler failure
+// is recorded on the consumer span and counted in messaging.errors.total.
+func TestOTelIntegration_HandlerErrorSpanAndMetric(t *testing.T) {
+	host, port := startMQContainer(t)
+	tc, spanExp, reader := buildOTelConfig(t)
+
+	cfg := mqConfig(host, port)
+	cfg.Telemetry = tc
+
+	client, err := mq.NewClient(cfg)
+	require.NoError(t, err)
+	defer client.Close()
+
+	putMessage(t, cfg, mqTestQueue, "handler-failure")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	handlerDone := make(chan struct{}, 1)
+
+	listener := client.NewListener(mqTestQueue)
+	go func() {
+		_ = listener.Start(ctx, func(_ context.Context, _ *mq.Message) error {
+			handlerDone <- struct{}{}
+			return assert.AnError
+		})
+	}()
+
+	select {
+	case <-handlerDone:
+	case <-time.After(10 * time.Second):
+		t.Fatal("message was not handled within timeout")
+	}
+	cancel()
+
+	// Allow the span and metric exporters to observe the event.
+	time.Sleep(200 * time.Millisecond)
+
+	rm := collectMetrics(t, reader)
+	ctr := findCounter(rm, "messaging.errors.total")
+	require.NotNil(t, ctr, "messaging.errors.total counter must exist")
+	foundHandlerError := false
+	for _, dp := range ctr.DataPoints {
+		for _, kv := range dp.Attributes.ToSlice() {
+			if string(kv.Key) == "error.type" && kv.Value.AsString() == "handler_failed" {
+				foundHandlerError = true
+			}
+		}
+	}
+	assert.True(t, foundHandlerError,
+		"handler failures must increment messaging.errors.total{error.type=handler_failed}")
+
+	foundFailedSpan := false
+	for _, s := range spanExp.GetSpans() {
+		if s.Name == "messaging receive" && s.Status.Code == codes.Error {
+			foundFailedSpan = true
+		}
+	}
+	assert.True(t, foundFailedSpan, "the consumer span must be marked as failed")
 }
 
 // spanNames returns the names of all collected spans for diagnostic messages.

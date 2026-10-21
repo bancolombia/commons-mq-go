@@ -81,7 +81,7 @@ func startBenchMQContainer(tb testing.TB) (host string, port int) {
 	if err != nil {
 		tb.Fatalf("get port: %v", err)
 	}
-	return h, p.Int()
+	return h, int(p.Num())
 }
 
 // benchMQConfig builds a mq.Config for the given host/port.

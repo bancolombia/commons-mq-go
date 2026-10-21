@@ -6,20 +6,24 @@ import (
 	"fmt"
 	"time"
 
-	"github.com/bancolombia/commons-mq-go/internal/correlation"
 	ibmmq "github.com/ibm-messaging/mq-golang/v5/ibmmq"
 )
 
 // requestReplyViaFixedQueue implements the FixedQueueSelector request-reply flow:
 //
-//  1. Generate a unique 24-byte correlation ID.
-//  2. Register the correlation ID in the registry → get a response channel.
-//  3. Spawn a background goroutine that opens replyQueue (MQOO_INPUT_SHARED)
-//     and blocks on GetSlice with MQMO_MATCH_CORREL_ID; on success it delivers
-//     the response via the registry and exits.
-//  4. PUT the request to requestQueue with MQMD.CorrelId and MQMD.ReplyToQ set.
-//  5. Block on the response channel with a timeout (via context + time.After).
-//  6. Deregister the correlation ID regardless of outcome.
+//  1. Generate a unique 24-byte correlation ID (or use the one supplied by the
+//     MessageCreator).
+//  2. Build the outgoing message and let the MessageCreator customize it.
+//  3. Open the shared reply queue (MQOO_INPUT_SHARED) and the request queue.
+//  4. PUT the request with MQMD.CorrelId and MQMD.ReplyToQ set.
+//  5. Block on GET from the reply queue with MQMO_MATCH_CORREL_ID for at most
+//     timeout; return ErrTimeout when no matching reply arrives.
+//
+// Every MQI call runs on the caller's goroutine. The Go binding establishes
+// connections with MQCNO_HANDLE_SHARE_NO_BLOCK, so making concurrent calls on a
+// single connection (for example a blocking GET alongside an MQOPEN) fails with
+// MQRC_CALL_IN_PROGRESS. Each RequestReply call owns its connection, so keeping
+// the flow synchronous keeps every connection handle single-threaded.
 //
 // Multiple concurrent callers can safely share the same fixed reply queue because
 // IBM MQ routes each GET to the message whose CorrelId matches the filter.
@@ -27,7 +31,6 @@ func requestReplyViaFixedQueue(
 	conn *connection,
 	requestQueue, replyQueue string,
 	creator MessageCreator,
-	reg *correlation.Registry[*Message],
 	timeout time.Duration,
 ) (*Message, error) {
 	qm := conn.QueueManager()
@@ -37,69 +40,12 @@ func requestReplyViaFixedQueue(
 	if _, err := rand.Read(correlBytes[:]); err != nil {
 		return nil, fmt.Errorf("commons-mq-go: failed to generate correlation ID: %w", err)
 	}
-	correlHex := hex.EncodeToString(correlBytes[:])
 
-	// ── 2. Register correlation ID → response channel ─────────────────────────
-	respCh := reg.Register(correlHex)
-	defer reg.Deregister(correlHex)
-
-	// ── 3. Spawn background goroutine to GET from the fixed reply queue ───────
-	// The goroutine opens its own handle to the reply queue so that concurrent
-	// callers do not contend on a single queue object.
-	errCh := make(chan error, 1)
-	go func() {
-		replyOD := ibmmq.NewMQOD()
-		replyOD.ObjectName = replyQueue
-
-		replyQObj, err := qm.Open(replyOD,
-			ibmmq.MQOO_INPUT_SHARED|ibmmq.MQOO_FAIL_IF_QUIESCING)
-		if err != nil {
-			errCh <- fmt.Errorf("commons-mq-go: failed to open fixed reply queue %q: %w",
-				replyQueue, sanitizeError(err))
-			return
-		}
-		defer replyQObj.Close(0)
-
-		// Set up GET descriptor with correlation ID filter.
-		getMD := ibmmq.NewMQMD()
-		copy(getMD.CorrelId, correlBytes[:])
-
-		getGMO := ibmmq.NewMQGMO()
-		getGMO.Options = ibmmq.MQGMO_WAIT | ibmmq.MQGMO_NO_SYNCPOINT
-		getGMO.MatchOptions = ibmmq.MQMO_MATCH_CORREL_ID
-		waitMS := int32(timeout.Milliseconds())
-		if waitMS <= 0 {
-			waitMS = 1
-		}
-		getGMO.WaitInterval = waitMS
-
-		buf := make([]byte, 4*1024*1024)
-		data, _, getErr := replyQObj.GetSlice(getMD, getGMO, buf)
-		if getErr != nil {
-			if IsEmptyQueueError(getErr) {
-				// Timeout — no-op; the main goroutine will surface ErrTimeout.
-				return
-			}
-			errCh <- fmt.Errorf("commons-mq-go: failed to receive fixed-queue reply: %w",
-				sanitizeError(getErr))
-			return
-		}
-
-		body := make([]byte, len(data))
-		copy(body, data)
-		msg := &Message{
-			ID:                  hex.EncodeToString(getMD.MsgId),
-			CorrelationID:       hex.EncodeToString(getMD.CorrelId),
-			ReplyToQueue:        getMD.ReplyToQ,
-			ReplyToQueueManager: getMD.ReplyToQMgr,
-			Body:                body,
-		}
-		reg.Deliver(correlHex, msg)
-	}()
-
-	// ── 4. Build outgoing message ─────────────────────────────────────────────
+	// ── 2. Build outgoing message and invoke the creator ──────────────────────
+	// The creator runs before any MQI call so a custom CorrelationID is used
+	// consistently by both the request MQMD and the reply GET filter.
 	msg := &Message{
-		CorrelationID:  correlHex,
+		CorrelationID:  hex.EncodeToString(correlBytes[:]),
 		ReplyToQueue:   replyQueue,
 		UserProperties: make(map[string]string),
 	}
@@ -107,20 +53,32 @@ func requestReplyViaFixedQueue(
 		if err := creator(msg); err != nil {
 			return nil, fmt.Errorf("commons-mq-go: MessageCreator returned error: %w", err)
 		}
-		// If the creator changed the CorrelationID, update the registry mapping.
-		if msg.CorrelationID != correlHex {
-			reg.Deregister(correlHex)
-			correlHex = msg.CorrelationID
-			respCh = reg.Register(correlHex)
-			defer reg.Deregister(correlHex)
-			// Reparse the correlation bytes for MQMD.
-			if decoded, decErr := hex.DecodeString(correlHex); decErr == nil && len(decoded) <= 24 {
-				copy(correlBytes[:], decoded)
-			}
-		}
 	}
 
-	// ── 5. Open request queue and PUT ─────────────────────────────────────────
+	// A creator-supplied correlation ID becomes the routing key.
+	if msg.CorrelationID != "" {
+		decoded, decErr := hex.DecodeString(msg.CorrelationID)
+		if decErr != nil || len(decoded) > len(correlBytes) {
+			return nil, fmt.Errorf(
+				"commons-mq-go: invalid correlation ID %q: must be an even-length hex string of at most %d characters",
+				msg.CorrelationID, len(correlBytes)*2)
+		}
+		correlBytes = [24]byte{}
+		copy(correlBytes[:], decoded)
+	}
+
+	// ── 3. Open the shared reply queue ────────────────────────────────────────
+	replyOD := ibmmq.NewMQOD()
+	replyOD.ObjectName = replyQueue
+	replyQObj, err := qm.Open(replyOD,
+		ibmmq.MQOO_INPUT_SHARED|ibmmq.MQOO_FAIL_IF_QUIESCING)
+	if err != nil {
+		return nil, fmt.Errorf("commons-mq-go: failed to open fixed reply queue %q: %w",
+			replyQueue, sanitizeError(err))
+	}
+	defer replyQObj.Close(0)
+
+	// ── 4. Open request queue and PUT ─────────────────────────────────────────
 	reqOD := ibmmq.NewMQOD()
 	reqOD.ObjectName = requestQueue
 	reqQObj, err := qm.Open(reqOD, ibmmq.MQOO_OUTPUT|ibmmq.MQOO_FAIL_IF_QUIESCING)
@@ -136,6 +94,9 @@ func requestReplyViaFixedQueue(
 
 	copy(mqmd.CorrelId, correlBytes[:])
 	mqmd.ReplyToQ = replyQueue
+	if conn.config.SetQueueManager {
+		mqmd.ReplyToQMgr = conn.config.QueueManagerName
+	}
 
 	if msg.TTL > 0 {
 		mqmd.Expiry = int32(msg.TTL / (100 * time.Millisecond))
@@ -146,22 +107,28 @@ func requestReplyViaFixedQueue(
 			requestQueue, sanitizeError(err))
 	}
 
-	// ── 6. Block for response (or timeout) ────────────────────────────────────
-	timer := time.NewTimer(timeout)
-	defer timer.Stop()
+	// ── 5. GET the correlated reply ───────────────────────────────────────────
+	getMD := ibmmq.NewMQMD()
+	copy(getMD.CorrelId, correlBytes[:])
 
-	select {
-	case resp := <-respCh:
-		return resp, nil
-	case err := <-errCh:
-		return nil, err
-	case <-timer.C:
-		return nil, ErrTimeout
+	getGMO := ibmmq.NewMQGMO()
+	getGMO.Options = ibmmq.MQGMO_WAIT | ibmmq.MQGMO_NO_SYNCPOINT
+	getGMO.MatchOptions = ibmmq.MQMO_MATCH_CORREL_ID
+	waitMS := int32(timeout.Milliseconds())
+	if waitMS <= 0 {
+		waitMS = 1
 	}
-}
+	getGMO.WaitInterval = waitMS
 
-// newFixedRRRegistry creates the per-instance correlation registry used by
-// FixedQueueSelector RequestReplyClients.
-func newFixedRRRegistry() *correlation.Registry[*Message] {
-	return correlation.NewRegistry[*Message]()
+	buf := make([]byte, 4*1024*1024)
+	data, _, err := replyQObj.GetSlice(getMD, getGMO, buf)
+	if err != nil {
+		if IsEmptyQueueError(err) {
+			return nil, ErrTimeout
+		}
+		return nil, fmt.Errorf("commons-mq-go: failed to receive fixed-queue reply: %w",
+			sanitizeError(err))
+	}
+
+	return messageFromMQMD(getMD, data), nil
 }

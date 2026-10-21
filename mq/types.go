@@ -18,6 +18,14 @@ const (
 	// StateFailed means reconnection attempts were exhausted; the connection is
 	// permanently down and the Client should be discarded.
 	StateFailed
+
+	// StateUnknown means the component has not attempted to connect yet.
+	// It is never considered alive by [Client.Health].
+	StateUnknown
+
+	// StateStopped means the component was deliberately stopped (context
+	// cancellation or [Client.Close]) and is no longer consuming messages.
+	StateStopped
 )
 
 // RequestReplyMode determines the mechanism used for request-reply correlation.
@@ -38,8 +46,11 @@ const (
 // The context carries the OTel span extracted from the message's propagation headers
 // (when Telemetry is configured), allowing callers to create child spans.
 //
-// Returning a non-nil error marks the processing as failed. The library logs the error
-// and continues consuming subsequent messages (at-most-once delivery).
+// Returning a non-nil error (or panicking) marks the processing as failed.
+// Delivery is at-most-once: the message has already been removed from the queue
+// and is not requeued, so it is lost unless the application handles it elsewhere.
+// Failures are reported to the [WithListenerErrorHandler] callback, the consumer
+// span, and the error metric; the consumer then continues with subsequent messages.
 type MessageHandler func(ctx context.Context, msg *Message) error
 
 // MessageCreator is called immediately before a message is sent, allowing the caller
@@ -113,4 +124,9 @@ type ConnectionStatus struct {
 	// Reason is a human-readable description of why the connection is not alive.
 	// Empty when Alive is true.
 	Reason string
+
+	// Component identifies the library component this entry describes, e.g.
+	// `listener "DEV.QUEUE.1" consumer 0`, `sender "DEV.QUEUE.1"`, or
+	// `request-reply "DEV.QUEUE.1"`.
+	Component string
 }

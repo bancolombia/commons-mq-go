@@ -21,11 +21,27 @@ type Listener struct {
 	maxRetries  int
 	queueOpts   QueueOptions
 	tel         *mqTelemetry
+	onError     ListenerErrorHandler
 
-	// lastConnState tracks the most recent connection state observed by runConsumer.
-	// Stored as int32 so it can be read atomically (0=Connected, 1=Reconnecting, 2=Failed).
-	lastConnState atomic.Int32
+	mu      sync.Mutex
+	started bool
+	closed  bool
+	cancel  context.CancelFunc
+	done    chan struct{}
+
+	// states tracks the connection state of each consumer independently.
+	// Initialized to [StateUnknown] in [Client.NewListener].
+	states []atomic.Int32
 }
+
+// ListenerErrorHandler receives errors that occur while consuming.
+//
+// msg is non-nil when a message handler returned an error or panicked; msg is
+// nil for consumer lifecycle errors, such as a consumer stopping after
+// exhausting its reconnect attempts. The callback runs on the consumer
+// goroutine and must not block indefinitely. A panic from the callback is
+// recovered and discarded so it cannot stop the consumer.
+type ListenerErrorHandler func(ctx context.Context, msg *Message, err error)
 
 // ListenerOption is a functional option for configuring a [Listener].
 type ListenerOption func(*Listener)
@@ -58,27 +74,66 @@ func WithListenerMaxRetries(n int) ListenerOption {
 	}
 }
 
+// WithListenerErrorHandler registers a callback invoked whenever a message
+// handler fails (returns an error or panics) or a consumer stops on an error.
+// See [ListenerErrorHandler].
+func WithListenerErrorHandler(h ListenerErrorHandler) ListenerOption {
+	return func(l *Listener) {
+		l.onError = h
+	}
+}
+
+// initStates allocates the per-consumer state slots. Called by
+// [Client.NewListener] after functional options have set the concurrency.
+func (l *Listener) initStates() {
+	l.states = make([]atomic.Int32, l.concurrency)
+	for i := range l.states {
+		l.states[i].Store(int32(StateUnknown))
+	}
+}
+
 // Start begins consuming messages from the queue. It opens [concurrency] independent
 // IBM MQ connections, launches one consumer goroutine per connection, and blocks
 // until all goroutines have exited.
 //
 // When ctx is cancelled all goroutines stop and Start returns nil. If goroutines
 // fail to connect or exhaust their reconnect retries, Start returns a joined error.
+// Partial consumer failures are reported through [WithListenerErrorHandler] and
+// [Client.Health] while the remaining consumers keep running.
 //
-// Start returns an error only if startup fails; runtime handler errors are logged
-// and do not stop the consumer.
+// Start may be called only once. It returns [ErrClientClosed] if [Client.Close]
+// has already been called.
 func (l *Listener) Start(ctx context.Context, handler MessageHandler) error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return ErrClientClosed
+	}
+	if l.started {
+		l.mu.Unlock()
+		return fmt.Errorf("commons-mq-go: Listener.Start may only be called once")
+	}
+	l.started = true
+	runCtx, cancel := context.WithCancel(ctx)
+	l.cancel = cancel
+	done := make(chan struct{})
+	l.done = done
+	l.mu.Unlock()
+
+	defer close(done)
+	defer cancel()
+
 	errs := make(chan error, l.concurrency)
 	var wg sync.WaitGroup
 
-	for range l.concurrency {
+	for i := range l.concurrency {
 		wg.Add(1)
-		go func() {
+		go func(idx int) {
 			defer wg.Done()
-			if err := l.runConsumer(ctx, handler); err != nil {
+			if err := l.runConsumer(runCtx, handler, idx); err != nil {
 				errs <- err
 			}
-		}()
+		}(i)
 	}
 
 	wg.Wait()
@@ -91,9 +146,42 @@ func (l *Listener) Start(ctx context.Context, handler MessageHandler) error {
 	return errors.Join(errList...)
 }
 
+// close cancels a running Start and waits for all consumer goroutines to exit.
+// It is registered with the Client and invoked by [Client.Close].
+func (l *Listener) close() error {
+	l.mu.Lock()
+	if l.closed {
+		l.mu.Unlock()
+		return nil
+	}
+	l.closed = true
+	cancel := l.cancel
+	done := l.done
+	l.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	if done != nil {
+		<-done
+	}
+	return nil
+}
+
 // runConsumer manages a single consumer connection lifecycle. It opens a connection,
 // starts the consume loop, and reconnects transparently on connection-level errors.
-func (l *Listener) runConsumer(ctx context.Context, handler MessageHandler) error {
+func (l *Listener) runConsumer(ctx context.Context, handler MessageHandler, idx int) (retErr error) {
+	// Every exit path updates this consumer's observable state. Errors are also
+	// reported to the application so partial failures are not silent.
+	defer func() {
+		if retErr != nil {
+			l.setConsumerState(idx, StateFailed)
+			l.reportError(ctx, nil, retErr)
+			return
+		}
+		l.setConsumerState(idx, StateStopped)
+	}()
+
 	// Honour early cancellation before attempting any network dial.
 	select {
 	case <-ctx.Done():
@@ -104,13 +192,16 @@ func (l *Listener) runConsumer(ctx context.Context, handler MessageHandler) erro
 	cfg := l.client.cfg
 	cfg.MaxRetries = l.maxRetries
 
-	conn, err := newConnection(&cfg)
+	l.setConsumerState(idx, StateReconnecting)
+	conn, err := newConnectionWithRetry(ctx, &cfg)
 	if err != nil {
-		l.lastConnState.Store(int32(StateFailed))
+		if ctx.Err() != nil {
+			return nil // expected shutdown during retry — StateStopped
+		}
 		return err
 	}
 	defer conn.Close()
-	l.lastConnState.Store(int32(StateConnected))
+	l.setConsumerState(idx, StateConnected)
 	l.tel.incConnActive()
 	defer l.tel.decConnActive()
 
@@ -125,12 +216,14 @@ func (l *Listener) runConsumer(ctx context.Context, handler MessageHandler) erro
 		}
 
 		if IsConnectionError(loopErr) {
-			l.lastConnState.Store(int32(StateReconnecting))
-			if reconnErr := conn.Reconnect(); reconnErr != nil {
-				l.lastConnState.Store(int32(StateFailed))
+			l.setConsumerState(idx, StateReconnecting)
+			if reconnErr := conn.Reconnect(ctx); reconnErr != nil {
+				if ctx.Err() != nil {
+					return nil // shutdown during reconnect — StateStopped
+				}
 				return reconnErr
 			}
-			l.lastConnState.Store(int32(StateConnected))
+			l.setConsumerState(idx, StateConnected)
 			// Reconnected — reopen queue and resume.
 			continue
 		}
@@ -184,10 +277,31 @@ func (l *Listener) consumeLoop(ctx context.Context, conn *connection, handler Me
 		// Create a consumer span as a child of the sender's span (if any).
 		spanCtx, span := l.tel.startConsumerSpan(msgCtx, l.queue, msg.ID)
 		start := time.Now()
-		InvokeHandlerSafe(spanCtx, handler, msg)
+		handlerErr := invokeHandler(spanCtx, handler, msg)
+		if handlerErr != nil {
+			l.tel.incError(spanCtx, "handler_failed")
+			l.reportError(spanCtx, msg, handlerErr)
+		}
 		l.tel.recordReceiveDuration(spanCtx, start)
-		span.End()
+		endSpan(span, handlerErr)
 	}
+}
+
+// setConsumerState stores the state of consumer idx.
+func (l *Listener) setConsumerState(idx int, state ConnectionState) {
+	if idx >= 0 && idx < len(l.states) {
+		l.states[idx].Store(int32(state))
+	}
+}
+
+// reportError invokes the application error callback, protecting the consumer
+// from a panicking callback.
+func (l *Listener) reportError(ctx context.Context, msg *Message, err error) {
+	if l.onError == nil || err == nil {
+		return
+	}
+	defer func() { _ = recover() }()
+	l.onError(ctx, msg, err)
 }
 
 // messageFromMQMD converts an IBM MQ MQMD and raw body bytes into a [Message].
@@ -206,14 +320,22 @@ func messageFromMQMD(mqmd *ibmmq.MQMD, body []byte) *Message {
 }
 
 // InvokeHandlerSafe calls handler and recovers from any panic so the consumer
-// goroutine does not crash. A recovered panic is silently discarded; the goroutine
-// continues to the next message.
+// goroutine does not crash. The returned error is discarded; use
+// [WithListenerErrorHandler] to observe handler failures.
 //
 // Exported to allow external packages (including test suites) to verify the panic
 // recovery contract independently of a live IBM MQ connection.
 func InvokeHandlerSafe(ctx context.Context, handler MessageHandler, msg *Message) {
+	_ = invokeHandler(ctx, handler, msg)
+}
+
+// invokeHandler calls handler, converting a panic into an error wrapping
+// [ErrHandlerPanic].
+func invokeHandler(ctx context.Context, handler MessageHandler, msg *Message) (err error) {
 	defer func() {
-		_ = recover()
+		if r := recover(); r != nil {
+			err = fmt.Errorf("%w: %v", ErrHandlerPanic, r)
+		}
 	}()
-	_ = handler(ctx, msg)
+	return handler(ctx, msg)
 }

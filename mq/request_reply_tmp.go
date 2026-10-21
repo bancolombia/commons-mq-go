@@ -3,10 +3,11 @@ package mq
 import (
 	"context"
 	"encoding/hex"
+	"errors"
 	"fmt"
+	"sync"
 	"time"
 
-	"github.com/bancolombia/commons-mq-go/internal/correlation"
 	ibmmq "github.com/ibm-messaging/mq-golang/v5/ibmmq"
 )
 
@@ -28,9 +29,12 @@ type RequestReplyClient struct {
 	requestQueue string // queue to which requests are sent
 	replyQueue   string // fixed reply queue (FixedQueueSelector mode only)
 	mode         RequestReplyMode
-	registry     *correlation.Registry[*Message] // non-nil only in FixedQueueSelector mode
 	tel          *mqTelemetry
-	closed       bool
+
+	mu      sync.Mutex
+	closed  bool
+	state   ConnectionState
+	lastErr error
 }
 
 // RROption is a functional option for configuring a [RequestReplyClient].
@@ -77,6 +81,13 @@ func (r *RequestReplyClient) RequestReplyWithCreator(ctx context.Context, creato
 	default:
 	}
 
+	r.mu.Lock()
+	if r.closed {
+		r.mu.Unlock()
+		return nil, ErrClientClosed
+	}
+	r.mu.Unlock()
+
 	// ── OTel: client span wrapping the full round-trip ────────────────────────
 	spanCtx, span := r.tel.startClientSpan(ctx, r.requestQueue)
 	defer func() { span.End() }()
@@ -94,6 +105,7 @@ func (r *RequestReplyClient) RequestReplyWithCreator(ctx context.Context, creato
 
 	conn, err := newConnection(&r.client.cfg)
 	if err != nil {
+		r.recordState(StateFailed, err)
 		span.RecordError(err)
 		return nil, err
 	}
@@ -101,20 +113,39 @@ func (r *RequestReplyClient) RequestReplyWithCreator(ctx context.Context, creato
 
 	var reply *Message
 	if r.mode == FixedQueueSelector {
-		reply, err = requestReplyViaFixedQueue(conn, r.requestQueue, r.replyQueue, wrappedCreator, r.registry, timeout)
+		reply, err = requestReplyViaFixedQueue(conn, r.requestQueue, r.replyQueue, wrappedCreator, timeout)
 	} else {
-		reply, err = requestReplyViaTempQueue(conn, r.requestQueue, wrappedCreator, timeout)
+		reply, err = requestReplyViaTempQueue(conn, r.requestQueue, r.client.cfg.ModelQueue, wrappedCreator, timeout)
 	}
 	if err != nil {
 		span.RecordError(err)
+		// A timeout or a non-connection error means the connection itself worked.
+		if errors.Is(err, ErrTimeout) || !IsConnectionError(err) {
+			r.recordState(StateConnected, nil)
+		} else {
+			r.recordState(StateFailed, err)
+		}
+	} else {
+		r.recordState(StateConnected, nil)
 	}
 	return reply, err
 }
 
+// recordState updates the client's tracked connection state for Health().
+func (r *RequestReplyClient) recordState(state ConnectionState, err error) {
+	r.mu.Lock()
+	r.state = state
+	r.lastErr = err
+	r.mu.Unlock()
+}
+
 // Close releases any resources held by this RequestReplyClient.
-// It is safe to call Close multiple times.
+// It is safe to call Close multiple times. Calls to RequestReply after Close
+// return [ErrClientClosed].
 func (r *RequestReplyClient) Close() error {
+	r.mu.Lock()
 	r.closed = true
+	r.mu.Unlock()
 	return nil
 }
 
@@ -127,7 +158,7 @@ func (r *RequestReplyClient) Close() error {
 //  6. Return the response message or ErrTimeout.
 func requestReplyViaTempQueue(
 	conn *connection,
-	requestQueue string,
+	requestQueue, modelQueue string,
 	creator MessageCreator,
 	timeout time.Duration,
 ) (*Message, error) {
@@ -135,9 +166,9 @@ func requestReplyViaTempQueue(
 
 	// ── 1. Open dynamic (temporary) reply queue ───────────────────────────────
 	// DynamicQName = "AMQ.*" tells IBM MQ to allocate a unique queue with the
-	// "AMQ." prefix. The resolved name is written back into MQOD.ResolvedQName.
+	// "AMQ." prefix. The resolved name is written back into MQOD.ObjectName.
 	replyOD := ibmmq.NewMQOD()
-	replyOD.ObjectName = "SYSTEM.DEFAULT.MODEL.QUEUE"
+	replyOD.ObjectName = modelQueue
 	replyOD.DynamicQName = "AMQ.*"
 
 	// MQOO_INPUT_EXCLUSIVE on the temp queue ensures only this process can receive
@@ -179,6 +210,9 @@ func requestReplyViaTempQueue(
 	mqpmo.Options = ibmmq.MQPMO_NEW_MSG_ID | ibmmq.MQPMO_NO_SYNCPOINT
 
 	mqmd.ReplyToQ = replyQueueName
+	if conn.config.SetQueueManager {
+		mqmd.ReplyToQMgr = conn.config.QueueManagerName
+	}
 
 	// TTL from per-message value.
 	if msg.TTL > 0 {

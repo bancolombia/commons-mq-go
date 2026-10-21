@@ -92,20 +92,25 @@ import (
 )
 
 func main() {
-    client, _ := mq.NewClient(mq.Config{
+    client, err := mq.NewClient(mq.Config{
         QueueManagerName: "QM1",
         ConnectionName:   "localhost(1414)",
         ChannelName:      "DEV.APP.SVRCONN",
         Username:         "app",
         Password:         "passw0rd",
     })
+    if err != nil {
+        log.Fatal(err)
+    }
     defer client.Close()
 
     listener := client.NewListener("DEV.QUEUE.1")
-    _ = listener.Start(context.Background(), func(_ context.Context, msg *mq.Message) error {
+    if err := listener.Start(context.Background(), func(_ context.Context, msg *mq.Message) error {
         log.Printf("received: %s", msg.Body)
         return nil
-    })
+    }); err != nil {
+        log.Fatal(err)
+    }
 }
 ```
 
@@ -138,6 +143,8 @@ msgID, err := sender.Send(context.Background(), "hello world")
 rr := client.NewRequestReplyClient("DEV.QUEUE.1")
 reply, err := rr.RequestReply(context.Background(), "ping", 5*time.Second)
 ```
+
+Temporary-queue mode creates dynamic reply queues from `Config.ModelQueue` (default `SYSTEM.DEFAULT.MODEL.QUEUE`). The IBM MQ developer image with the `app` user does not grant authority on that queue, so add `ModelQueue: "DEV.APP.MODEL.QUEUE"` to the config when using the Docker image above.
 
 ## Next steps
 

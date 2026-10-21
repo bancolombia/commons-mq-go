@@ -1,7 +1,9 @@
 package unit_test
 
 import (
+	"context"
 	"testing"
+	"time"
 
 	"github.com/bancolombia/commons-mq-go/mq"
 	"github.com/stretchr/testify/assert"
@@ -41,35 +43,75 @@ func TestHealth_NewSenderNotYetUsed_IsHealthy(t *testing.T) {
 	assert.True(t, h.Healthy, "sender with empty pool should be healthy (idle)")
 }
 
-// T065: Health() after NewListener (before Start) returns Healthy=false because
-// lastConnState is 0 (StateConnected = iota = 0) which is actually "connected".
-// A never-started listener has default zero value = StateConnected.
-// This is the expected behaviour: the library only reports unhealthy if it has
-// explicitly detected a failure.
-func TestHealth_NewListenerNotYetStarted_IsHealthy(t *testing.T) {
+// T065: Health() after NewListener (before Start) reports unhealthy: a registered
+// listener is expected to be consuming, and a never-started consumer is unknown.
+func TestHealth_NewListenerNotYetStarted_IsUnhealthy(t *testing.T) {
 	client := buildHealthClient(t)
 	_ = client.NewListener("QUEUE.IN")
 	h := client.Health()
-	// A listener that hasn't started yet has state=StateConnected (zero value).
-	// The library reports it as healthy until a real failure is observed.
-	assert.True(t, h.Healthy)
+	assert.False(t, h.Healthy, "a never-started listener must not report healthy")
 	require.Len(t, h.Details, 1)
 	assert.Equal(t, "QM1", h.Details[0].QueueManager)
+	assert.False(t, h.Details[0].Alive)
+	assert.Contains(t, h.Details[0].Reason, "unknown")
+	assert.Contains(t, h.Details[0].Component, "QUEUE.IN")
 }
 
-// T065: Multiple components — all-alive → overall Healthy=true.
-func TestHealth_AllAlive_IsHealthy(t *testing.T) {
+// T065: Every consumer of every listener contributes its own status entry.
+func TestHealth_MultipleListeners_EmitPerConsumerDetails(t *testing.T) {
 	client := buildHealthClient(t)
 	_ = client.NewListener("QUEUE.A")
-	_ = client.NewListener("QUEUE.B")
+	_ = client.NewListener("QUEUE.B", mq.WithListenerConcurrency(3))
 
 	h := client.Health()
-	assert.True(t, h.Healthy)
-	assert.Len(t, h.Details, 2)
+	assert.False(t, h.Healthy)
+	assert.Len(t, h.Details, 4, "1 consumer + 3 consumers must yield 4 details")
 	for _, d := range h.Details {
-		assert.True(t, d.Alive, "all details should report alive")
-		assert.Empty(t, d.Reason)
+		assert.False(t, d.Alive, "unstarted consumers must not report alive")
+		assert.Contains(t, d.Component, "listener")
 	}
+}
+
+// T065: A failed Sender connection is exposed by Health() even though no
+// connection remains allocated.
+func TestHealth_SenderConnectionFailure_IsUnhealthy(t *testing.T) {
+	cfg := mq.Config{
+		QueueManagerName:     "QM1",
+		ConnectionName:       "localhost(19999)",
+		ChannelName:          "DEV.APP.SVRCONN",
+		MaxRetries:           1,
+		InitialRetryInterval: time.Millisecond,
+		RetryMultiplier:      1.0,
+		MaxRetryInterval:     time.Millisecond,
+	}
+	client, err := mq.NewClient(cfg)
+	require.NoError(t, err)
+	defer client.Close()
+
+	sender := client.NewSender("QUEUE.OUT")
+	_, err = sender.Send(context.Background(), "payload")
+	require.Error(t, err)
+
+	h := client.Health()
+	assert.False(t, h.Healthy, "a sender whose connection failed must be unhealthy")
+	require.NotEmpty(t, h.Details)
+	assert.False(t, h.Details[0].Alive)
+	assert.Contains(t, h.Details[0].Reason, "failed")
+	assert.Contains(t, h.Details[0].Component, "QUEUE.OUT")
+}
+
+// T065: A request-reply client whose connection failed is exposed by Health().
+func TestHealth_RequestReplyConnectionFailure_IsUnhealthy(t *testing.T) {
+	client := buildHealthClient(t)
+	rr := client.NewRequestReplyClient("QUEUE.REQ")
+	_, err := rr.RequestReply(context.Background(), "ping", 50*time.Millisecond)
+	require.Error(t, err)
+
+	h := client.Health()
+	assert.False(t, h.Healthy)
+	require.NotEmpty(t, h.Details)
+	assert.False(t, h.Details[0].Alive)
+	assert.Contains(t, h.Details[0].Component, "QUEUE.REQ")
 }
 
 // T065: HealthStatus.Healthy is false when any Detail.Alive is false.

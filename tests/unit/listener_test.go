@@ -154,6 +154,62 @@ func TestListenerOption_WithQueueOptions_Accepted(t *testing.T) {
 	assert.NoError(t, err)
 }
 
+// TestListener_Start_AfterClientClose_ReturnsErrClientClosed verifies that a
+// closed Client cannot start a listener.
+func TestListener_Start_AfterClientClose_ReturnsErrClientClosed(t *testing.T) {
+	client, err := mq.NewClient(validListenerConfig())
+	require.NoError(t, err)
+
+	l := client.NewListener("DEV.QUEUE.1")
+	require.NoError(t, client.Close())
+
+	err = l.Start(context.Background(), func(_ context.Context, _ *mq.Message) error { return nil })
+	assert.ErrorIs(t, err, mq.ErrClientClosed)
+}
+
+// TestListener_Start_CalledTwice_ReturnsError verifies that Start is single-use.
+func TestListener_Start_CalledTwice_ReturnsError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+
+	client, err := mq.NewClient(validListenerConfig())
+	require.NoError(t, err)
+	defer client.Close()
+
+	l := client.NewListener("DEV.QUEUE.1")
+	require.NoError(t, l.Start(ctx, func(_ context.Context, _ *mq.Message) error { return nil }))
+
+	err = l.Start(context.Background(), func(_ context.Context, _ *mq.Message) error { return nil })
+	assert.Error(t, err, "second Start must return an error")
+}
+
+// TestListener_ClientClose_StopsStartedListener verifies that Client.Close
+// cancels a running listener and waits for Start to return.
+func TestListener_ClientClose_StopsStartedListener(t *testing.T) {
+	client, err := mq.NewClient(validListenerConfig())
+	require.NoError(t, err)
+
+	// The listener starts against an unreachable broker and blocks in its retry
+	// loop; Close must cancel it promptly.
+	l := client.NewListener("DEV.QUEUE.1", mq.WithListenerMaxRetries(10))
+	done := make(chan error, 1)
+	go func() {
+		done <- l.Start(context.Background(), func(_ context.Context, _ *mq.Message) error { return nil })
+	}()
+
+	time.Sleep(100 * time.Millisecond)
+	start := time.Now()
+	require.NoError(t, client.Close())
+	assert.Less(t, time.Since(start), 2*time.Second,
+		"Client.Close must stop a listener blocked in connect retries")
+
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("Listener.Start did not return after Client.Close")
+	}
+}
+
 // ── T079: FR-001 Panic recovery ───────────────────────────────────────────────
 
 // TestInvokeHandlerSafe_RecoversPanic verifies that a panicking handler does not

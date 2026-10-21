@@ -10,11 +10,11 @@ title: Overview
 - **Multi-connection queue listeners** — concurrent consumers using goroutines
 - **Message senders** — pooled connections with lazy initialisation
 - **Request-reply** — temporary queue and fixed-queue-selector patterns
-- **Automatic reconnection** — exponential backoff on connection failures
-- **Health checks** — liveness probes for operations/readiness endpoints
+- **Automatic reconnection** — context-aware, capped exponential backoff on connection failures
+- **Health checks** — state-based health for liveness/readiness endpoints, including per-consumer and terminal-failure states
 - **OpenTelemetry** — opt-in traces, metrics, and W3C TraceContext propagation
 
-The library requires **no JVM**, no Spring, and no Commons MQ runtime. It is distributed as a standard Go module and can be used in any Go 1.22+ application.
+The library requires **no JVM**, no Spring, and no Commons MQ runtime. It is distributed as a standard Go module and can be used in any Go 1.25+ application.
 
 ## Module
 
@@ -31,7 +31,7 @@ github.com/bancolombia/commons-mq-go
 
 ## Prerequisites
 
-- Go 1.22+
+- Go 1.25+
 - IBM MQ C client libraries installed on the host:
   - Linux: `/opt/mqm/lib64`
   - macOS: `/opt/mqm/lib`

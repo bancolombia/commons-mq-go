@@ -19,9 +19,13 @@ type Sender struct {
 	queue    string           // default destination queue
 	pool     chan *connection // buffered channel acting as connection pool
 	mu       sync.Mutex
-	created  int  // number of connections created so far
-	maxConns int  // pool capacity = concurrency
-	closed   bool // set once by close()
+	poolMu   sync.Mutex // serializes pool peeks (Health) with close draining
+	created  int        // number of connections created so far
+	maxConns int        // pool capacity = concurrency
+	closed   bool       // set once by close()
+	state    ConnectionState
+	lastErr  error
+	wg       sync.WaitGroup // tracks in-flight Send calls
 	tel      *mqTelemetry
 }
 
@@ -69,6 +73,18 @@ func (s *Sender) SendWithCreator(ctx context.Context, destination string, creato
 		return "", fmt.Errorf("commons-mq-go: no destination queue specified and Config.OutputQueue is empty")
 	}
 
+	// Register the in-flight operation before OTel setup. Client.Close sets
+	// closed and then waits for this WaitGroup, so the check and Add must be
+	// atomic with respect to close.
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		return "", ErrClientClosed
+	}
+	s.wg.Add(1)
+	s.mu.Unlock()
+	defer s.wg.Done()
+
 	// ── OTel: producer span + inject context ──────────────────────────────────
 	spanCtx, span := s.tel.startProducerSpan(ctx, destination)
 	start := time.Now()
@@ -95,17 +111,20 @@ func (s *Sender) SendWithCreator(ctx context.Context, destination string, creato
 
 	if putErr != nil && IsConnectionError(putErr) {
 		// Attempt transparent reconnect then retry the send once.
-		if reconnErr := conn.Reconnect(); reconnErr != nil {
+		s.setState(StateReconnecting, putErr)
+		if reconnErr := conn.Reconnect(ctx); reconnErr != nil {
 			// Reconnect exhausted retries — discard the connection permanently.
 			_ = conn.Close()
 			s.mu.Lock()
 			s.created--
 			s.mu.Unlock()
 			s.tel.decConnActive()
+			s.setState(StateFailed, reconnErr)
 			s.tel.incError(spanCtx, "connection_failed")
 			endSpan(span, reconnErr)
 			return "", reconnErr
 		}
+		s.setState(StateConnected, nil)
 		// Reconnected — retry the put on the refreshed connection.
 		msgID, putErr = s.put(conn, destination, wrappedCreator)
 		if putErr != nil {
@@ -114,10 +133,17 @@ func (s *Sender) SendWithCreator(ctx context.Context, destination string, creato
 			s.created--
 			s.mu.Unlock()
 			s.tel.decConnActive()
+			if IsConnectionError(putErr) {
+				s.setState(StateFailed, putErr)
+			}
 			s.tel.incError(spanCtx, "put_failed")
 			endSpan(span, putErr)
 			return "", putErr
 		}
+	}
+
+	if putErr == nil {
+		s.setState(StateConnected, nil)
 	}
 
 	s.tel.recordPublishDuration(spanCtx, start)
@@ -178,6 +204,9 @@ func (s *Sender) put(conn *connection, queueName string, creator MessageCreator)
 	// Apply reply-to routing fields from the creator.
 	mqmd.ReplyToQ = msg.ReplyToQueue
 	mqmd.ReplyToQMgr = msg.ReplyToQueueManager
+	if mqmd.ReplyToQ != "" && mqmd.ReplyToQMgr == "" && s.client.cfg.SetQueueManager {
+		mqmd.ReplyToQMgr = s.client.cfg.QueueManagerName
+	}
 
 	if err := qObj.Put(mqmd, mqpmo, msg.Body); err != nil {
 		return "", fmt.Errorf("commons-mq-go: failed to put message to queue %q: %w",
@@ -201,6 +230,7 @@ func (s *Sender) acquireConn(ctx context.Context) (*connection, error) {
 	// Non-blocking: grab an idle connection if one is available immediately.
 	select {
 	case conn := <-s.pool:
+		s.setState(StateConnected, nil)
 		return conn, nil
 	default:
 	}
@@ -214,40 +244,47 @@ func (s *Sender) acquireConn(ctx context.Context) (*connection, error) {
 	s.mu.Unlock()
 
 	if canCreate {
-		conn, err := newConnection(&s.client.cfg)
+		conn, err := newConnectionWithRetry(ctx, &s.client.cfg)
 		if err != nil {
 			s.mu.Lock()
 			s.created--
 			s.mu.Unlock()
+			if ctx.Err() == nil {
+				s.setState(StateFailed, err)
+			}
 			return nil, err
 		}
 		s.tel.incConnActive()
+		s.setState(StateConnected, nil)
 		return conn, nil
 	}
 
 	// All connections are in use — block until one is returned or ctx fires.
 	select {
 	case conn := <-s.pool:
+		s.setState(StateConnected, nil)
 		return conn, nil
 	case <-ctx.Done():
 		return nil, ctx.Err()
 	}
 }
 
-// releaseConn returns a healthy connection to the pool. If the Sender has been
-// closed it closes the connection instead to avoid leaks.
-func (s *Sender) releaseConn(conn *connection) {
+// setState updates the sender's tracked connection state for Health().
+func (s *Sender) setState(state ConnectionState, err error) {
 	s.mu.Lock()
-	closed := s.closed
+	s.state = state
+	s.lastErr = err
 	s.mu.Unlock()
-	if closed {
-		_ = conn.Close()
-		return
-	}
+}
+
+// releaseConn returns a connection to the pool. close() waits for all in-flight
+// sends before draining the pool, so the connection is always pooled here.
+func (s *Sender) releaseConn(conn *connection) {
 	s.pool <- conn
 }
 
-// close drains the connection pool and closes each connection.
+// close stops new sends, waits for in-flight sends to complete, then drains the
+// connection pool and closes each connection.
 // Registered with Client so it is called automatically by [Client.Close].
 func (s *Sender) close() error {
 	s.mu.Lock()
@@ -256,11 +293,20 @@ func (s *Sender) close() error {
 		return nil
 	}
 	s.closed = true
+	s.state = StateStopped
+	s.lastErr = nil
 	created := s.created
 	s.mu.Unlock()
 
+	// Wait for in-flight sends to return their connections to the pool.
+	s.wg.Wait()
+
+	s.poolMu.Lock()
+	defer s.poolMu.Unlock()
+
 	var errs []error
-	// Drain connections that are currently idle in the pool.
+	// Drain connections that are idle in the pool. In-flight connections were
+	// already returned by wg.Wait; some may have been closed on error paths.
 	for range created {
 		select {
 		case conn := <-s.pool:
@@ -268,7 +314,6 @@ func (s *Sender) close() error {
 				errs = append(errs, err)
 			}
 		default:
-			// Connection is currently checked out and will be closed by releaseConn.
 		}
 	}
 	return errors.Join(errs...)

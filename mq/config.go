@@ -20,6 +20,14 @@ var (
 
 	// ErrConnectionFailed is returned when MaxRetries are exhausted.
 	ErrConnectionFailed = errors.New("commons-mq-go: connection permanently failed")
+
+	// ErrClientClosed is returned by operations performed on a closed Sender,
+	// RequestReplyClient, or Listener.
+	ErrClientClosed = errors.New("commons-mq-go: client is closed")
+
+	// ErrHandlerPanic is wrapped by errors returned from a MessageHandler that
+	// panicked. The original panic value is included in the error message.
+	ErrHandlerPanic = errors.New("commons-mq-go: message handler panicked")
 )
 
 // Config holds all settings for connecting to IBM MQ and configuring
@@ -52,6 +60,11 @@ type Config struct {
 	// OutputQueue is the default queue name for producers.
 	OutputQueue string
 
+	// ModelQueue is the model queue used to create temporary reply queues in
+	// [TemporaryQueue] request-reply mode. Defaults to "SYSTEM.DEFAULT.MODEL.QUEUE".
+	// The application user must hold +get authority on this model queue.
+	ModelQueue string
+
 	// InputConcurrency is the number of parallel consumer connections. Defaults to 1.
 	InputConcurrency int
 
@@ -72,6 +85,11 @@ type Config struct {
 	// RetryMultiplier is the exponential backoff multiplier for reconnect intervals.
 	// Must be ≥ 1.0. Defaults to 2.0.
 	RetryMultiplier float64
+
+	// MaxRetryInterval caps the exponential backoff delay between reconnect
+	// attempts (before jitter is added). Defaults to 30 seconds. A cap prevents
+	// recovery from lagging many minutes behind the broker after a long outage.
+	MaxRetryInterval time.Duration
 
 	// SetQueueManager, when true, sets the resolved queue manager on reply-to queues.
 	// Useful in multi-queue-manager topologies.
@@ -121,6 +139,9 @@ type TelemetryConfig struct {
 // applyDefaults fills in zero-value fields with sensible defaults.
 // Called by [NewClient] before validation.
 func (c *Config) applyDefaults() {
+	if c.ModelQueue == "" {
+		c.ModelQueue = "SYSTEM.DEFAULT.MODEL.QUEUE"
+	}
 	if c.InputConcurrency <= 0 {
 		c.InputConcurrency = 1
 	}
@@ -135,6 +156,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.RetryMultiplier < 1.0 {
 		c.RetryMultiplier = 2.0
+	}
+	if c.MaxRetryInterval <= 0 {
+		c.MaxRetryInterval = 30 * time.Second
 	}
 }
 

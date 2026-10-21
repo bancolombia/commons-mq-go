@@ -21,6 +21,9 @@
 // Optional environment variables:
 //
 //	MQ_REPLY_QUEUE     - Fixed reply queue (required when MQ_RR_MODE=fixed)
+//	MQ_MODEL_QUEUE     - Model queue for temporary reply queues
+//	                     (default: "DEV.APP.MODEL.QUEUE", which the IBM MQ
+//	                     developer image authorises for the "app" user)
 //	MQ_USERNAME        - Application user ID
 //	MQ_PASSWORD        - Application password
 //	MQ_MSG_COUNT       - Number of request-reply round-trips (default: 3)
@@ -68,7 +71,15 @@ func main() {
 	// The replier receives requests from MQ_REQUEST_QUEUE. For each request it
 	// echoes the payload back (upper-cased) to msg.ReplyToQueue via a Sender.
 	replierSender := client.NewSender("")
-	replierListener := client.NewListener(requestQueue)
+	replierListener := client.NewListener(requestQueue,
+		mq.WithListenerErrorHandler(func(_ context.Context, msg *mq.Message, err error) {
+			if msg == nil {
+				log.Printf("[replier] consumer stopped: %v", err)
+				return
+			}
+			log.Printf("[replier] handler failed for message %s: %v", msg.ID, err)
+		}),
+	)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -127,16 +138,22 @@ func main() {
 			i+1, reply.CorrelationID, string(reply.Body))
 	}
 
-	log.Printf("all %d round-trips done — shutting down", msgCount)
+	log.Printf("all %d round-trips done", msgCount)
+
+	// ── Health check while the replier is still running ──────────────────────
+	status := client.Health()
+	log.Printf("health while running  healthy=%v", status.Healthy)
+	for _, d := range status.Details {
+		log.Printf("  connection  component=%s  alive=%v  reason=%s",
+			d.Component, d.Alive, d.Reason)
+	}
+
+	// ── Shut down ────────────────────────────────────────────────────────────
 	cancel()
 
 	if err := <-listenerDone; err != nil {
 		log.Printf("replier exited with error: %v", err)
 	}
-
-	// ── Health check ──────────────────────────────────────────────────────────
-	status := client.Health()
-	log.Printf("final health  healthy=%v", status.Healthy)
 }
 
 func rrModeLabel(mode string) string {
@@ -147,12 +164,19 @@ func rrModeLabel(mode string) string {
 }
 
 func configFromEnv() mq.Config {
+	modelQueue := os.Getenv("MQ_MODEL_QUEUE")
+	if modelQueue == "" {
+		// The IBM MQ developer image authorises the "app" user on this model
+		// queue, not on SYSTEM.DEFAULT.MODEL.QUEUE.
+		modelQueue = "DEV.APP.MODEL.QUEUE"
+	}
 	return mq.Config{
 		QueueManagerName: requireEnv("MQ_QUEUE_MANAGER"),
 		ConnectionName:   fmt.Sprintf("%s(%s)", requireEnv("MQ_HOST"), requireEnv("MQ_PORT")),
 		ChannelName:      requireEnv("MQ_CHANNEL"),
 		Username:         os.Getenv("MQ_USERNAME"),
 		Password:         os.Getenv("MQ_PASSWORD"),
+		ModelQueue:       modelQueue,
 	}
 }
 

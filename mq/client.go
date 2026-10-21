@@ -23,8 +23,9 @@ type Client struct {
 
 // NewClient creates a new Client from the provided Config.
 //
-// Defaults are applied to zero-value fields (InputConcurrency, OutputConcurrency,
-// MaxRetries, InitialRetryInterval, RetryMultiplier) before validation.
+// Defaults are applied to zero-value fields (ModelQueue, InputConcurrency,
+// OutputConcurrency, MaxRetries, InitialRetryInterval, RetryMultiplier,
+// MaxRetryInterval) before validation.
 // Returns an error if Config validation fails; never returns an error that
 // contains credential values.
 //
@@ -38,10 +39,14 @@ func NewClient(cfg Config) (*Client, error) {
 	return &Client{cfg: cfg}, nil
 }
 
-// Close shuts down all connections and goroutines managed by this Client.
-// It blocks until all in-flight operations complete.
+// Close shuts down all connections and goroutines managed by this Client:
+// senders are drained after in-flight sends complete, listeners are cancelled
+// and Start is awaited, and request-reply clients are marked closed.
+// It blocks until all in-flight operations and message handlers return.
 //
-// Close is idempotent: calling it more than once returns nil.
+// Close must not be called from inside a message handler, because it waits for
+// that handler to return first. Close is idempotent: calling it more than once
+// returns nil.
 func (c *Client) Close() error {
 	c.mu.Lock()
 	if c.closed {
@@ -89,10 +94,10 @@ func (c *Client) NewListener(queueName string, opts ...ListenerOption) *Listener
 	for _, opt := range opts {
 		opt(l)
 	}
-	// Register a health prober that reads the listener's last known connection state.
-	c.registerHealthProber(listenerHealthProber(l, func() ConnectionState {
-		return ConnectionState(l.lastConnState.Load())
-	}))
+	l.initStates()
+	// Client.Close cancels the listener's internal context and waits for Start.
+	c.register(l.close)
+	c.registerHealthProber(listenerHealthProber(l))
 	return l
 }
 
@@ -111,6 +116,7 @@ func (c *Client) NewSender(destinationQueue string, opts ...SenderOption) *Sende
 		queue:    destinationQueue,
 		maxConns: c.cfg.OutputConcurrency,
 		pool:     make(chan *connection, c.cfg.OutputConcurrency),
+		state:    StateUnknown,
 		tel:      newMQTelemetry(c.cfg.Telemetry),
 	}
 	for _, opt := range opts {
@@ -133,12 +139,14 @@ func (c *Client) NewRequestReplyClient(requestQueue string, opts ...RROption) *R
 		client:       c,
 		requestQueue: requestQueue,
 		mode:         TemporaryQueue,
+		state:        StateUnknown,
 		tel:          newMQTelemetry(c.cfg.Telemetry),
 	}
 	for _, opt := range opts {
 		opt(r)
 	}
 	c.register(r.Close)
+	c.registerHealthProber(requestReplyHealthProber(r))
 	return r
 }
 
@@ -155,13 +163,14 @@ func (c *Client) NewRequestReplyClientFixed(requestQueue, replyQueue string, opt
 		requestQueue: requestQueue,
 		replyQueue:   replyQueue,
 		mode:         FixedQueueSelector,
-		registry:     newFixedRRRegistry(),
+		state:        StateUnknown,
 		tel:          newMQTelemetry(c.cfg.Telemetry),
 	}
 	for _, opt := range opts {
 		opt(r)
 	}
 	c.register(r.Close)
+	c.registerHealthProber(requestReplyHealthProber(r))
 	return r
 }
 
