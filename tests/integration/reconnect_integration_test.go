@@ -10,6 +10,7 @@ import (
 	"errors"
 	"net"
 	"net/netip"
+	"os"
 	"strconv"
 	"sync/atomic"
 	"testing"
@@ -50,9 +51,17 @@ func startMQContainerWithRef(t *testing.T) (testcontainers.Container, string, in
 	require.NoError(t, err)
 	anyHost := netip.MustParseAddr("0.0.0.0")
 
+	img := os.Getenv("MQ_IMAGE_TAG")
+	if img == "" {
+		img = mqImage
+		t.Logf("integration test: using default MQ Image %s", img)
+	} else {
+		t.Logf("integration test: using external MQ Image configured via env 'MQ_IMAGE_TAG' : %s", img)
+	}
+
 	ctr, err := testcontainers.Run(
 		ctx,
-		mqImage,
+		img,
 		testcontainers.WithEnv(map[string]string{
 			"LICENSE":         "accept",
 			"MQ_QMGR_NAME":    mqQueueManager,

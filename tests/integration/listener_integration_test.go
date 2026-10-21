@@ -23,7 +23,7 @@ import (
 )
 
 const (
-	mqImage        = "gabheadz/mq:9.4.5.0-arm64" //"icr.io/ibm-messaging/mq:latest"
+	mqImage        = "icr.io/ibm-messaging/mq:latest"
 	mqPort         = "1414/tcp"
 	mqQueueManager = "QM1"
 	mqChannel      = "DEV.APP.SVRCONN"
@@ -42,7 +42,7 @@ func startMQContainer(t *testing.T) (host string, port int) {
 
 	img := os.Getenv("MQ_IMAGE_TAG")
 	if img == "" {
-		img = "gabheadz/mq:9.4.5.0-arm64"
+		img = mqImage
 		t.Logf("integration test: using default MQ Image %s", img)
 	} else {
 		t.Logf("integration test: using external MQ Image configured via env 'MQ_IMAGE_TAG' : %s", img)
