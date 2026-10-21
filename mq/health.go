@@ -95,9 +95,9 @@ func senderHealthProber(s *Sender) healthProber {
 
 		switch state {
 		case StateReconnecting:
-			return dead("connection state: reconnecting")
+			return dead(connectionStateReason(StateReconnecting))
 		case StateFailed:
-			reason := "connection state: failed"
+			reason := connectionStateReason(StateFailed)
 			if lastErr != nil {
 				reason += ": " + lastErr.Error()
 			}
@@ -124,14 +124,14 @@ func senderHealthProber(s *Sender) healthProber {
 			if connState == StateConnected {
 				return []ConnectionStatus{{QueueManager: qm, Alive: true, Component: component}}
 			}
-			return dead("connection state: " + stateLabel(connState))
+			return dead(connectionStateReason(connState))
 		default:
 			// All connections are checked out and actively in use. Only claim
 			// liveness when the sender has not observed a failure.
 			if state == StateConnected || state == StateUnknown {
 				return []ConnectionStatus{{QueueManager: qm, Alive: true, Component: component}}
 			}
-			return dead("connection state: " + stateLabel(state))
+			return dead(connectionStateReason(state))
 		}
 	}
 }
@@ -155,7 +155,7 @@ func listenerHealthProber(l *Listener) healthProber {
 			case closed:
 				reason = "listener is closed"
 			case !alive:
-				reason = "connection state: " + stateLabel(state)
+				reason = connectionStateReason(state)
 			}
 			details = append(details, ConnectionStatus{
 				QueueManager: qm,
@@ -193,7 +193,7 @@ func requestReplyHealthProber(r *RequestReplyClient) healthProber {
 			return nil // never used
 		}
 		if state == StateFailed {
-			reason := "connection state: failed"
+			reason := connectionStateReason(StateFailed)
 			if lastErr != nil {
 				reason += ": " + lastErr.Error()
 			}
@@ -210,6 +210,11 @@ func requestReplyHealthProber(r *RequestReplyClient) healthProber {
 			Component:    component,
 		}}
 	}
+}
+
+// connectionStateReason formats a ConnectionState for ConnectionStatus.Reason.
+func connectionStateReason(state ConnectionState) string {
+	return "connection state: " + stateLabel(state)
 }
 
 // stateLabel returns a human-readable label for a ConnectionState.
