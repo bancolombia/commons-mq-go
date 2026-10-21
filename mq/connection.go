@@ -1,6 +1,7 @@
 package mq
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -10,11 +11,34 @@ import (
 	ibmmq "github.com/ibm-messaging/mq-golang/v5/ibmmq"
 )
 
-// sleepWithJitter sleeps for d plus up to 10% random jitter to avoid thundering-herd
-// reconnect storms when multiple connections are recovering simultaneously.
-func sleepWithJitter(d time.Duration) {
-	jitter := time.Duration(rand.Int63n(int64(d / 10)))
-	time.Sleep(d + jitter)
+// sleepWithJitterCtx sleeps for d plus up to 10% random jitter to avoid
+// thundering-herd reconnect storms when multiple connections are recovering
+// simultaneously. It returns ctx.Err() if the context is cancelled first.
+func sleepWithJitterCtx(ctx context.Context, d time.Duration) error {
+	if d <= 0 {
+		d = time.Millisecond
+	}
+	jitterCeil := int64(d / 10)
+	if jitterCeil <= 0 {
+		jitterCeil = 1
+	}
+	timer := time.NewTimer(d + time.Duration(rand.Int63n(jitterCeil)))
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-timer.C:
+		return nil
+	}
+}
+
+// retryDelay returns the capped exponential backoff for a reconnect attempt.
+func retryDelay(cfg *Config, attempt int) time.Duration {
+	d := BackoffDuration(cfg.InitialRetryInterval, cfg.RetryMultiplier, attempt)
+	if d > cfg.MaxRetryInterval {
+		d = cfg.MaxRetryInterval
+	}
+	return d
 }
 
 // BackoffDuration computes the reconnect delay for a given attempt index using
@@ -41,8 +65,8 @@ type connection struct {
 	lastError error
 }
 
-// newConnection dials IBM MQ and returns a live connection, or an error if the dial fails.
-// The error never contains credential values (Username, Password, TLS material).
+// newConnection dials IBM MQ once and returns a live connection, or an error if
+// the dial fails. The error never contains credential values.
 func newConnection(cfg *Config) (*connection, error) {
 	c := &connection{
 		config: cfg,
@@ -52,6 +76,37 @@ func newConnection(cfg *Config) (*connection, error) {
 		return nil, err
 	}
 	return c, nil
+}
+
+// newConnectionWithRetry dials IBM MQ, retrying up to Config.MaxRetries times
+// with capped exponential backoff. It always makes at least one attempt, even
+// when MaxRetries is 0. The context bounds every wait between attempts.
+func newConnectionWithRetry(ctx context.Context, cfg *Config) (*connection, error) {
+	attempts := cfg.MaxRetries
+	if attempts < 1 {
+		attempts = 1
+	}
+
+	var lastErr error
+	for attempt := range attempts {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		c := &connection{config: cfg, state: StateReconnecting}
+		if err := c.dial(); err == nil {
+			return c, nil
+		} else {
+			lastErr = err
+		}
+		if attempt < attempts-1 {
+			if err := sleepWithJitterCtx(ctx, retryDelay(cfg, attempt)); err != nil {
+				return nil, err
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("%w: queue manager %q failed to connect after %d attempts: %w",
+		ErrConnectionFailed, cfg.QueueManagerName, attempts, lastErr)
 }
 
 // dial establishes (or re-establishes) the IBM MQ connection.
@@ -154,12 +209,17 @@ func (c *connection) Close() error {
 // that should trigger a reconnect attempt — as opposed to a queue or message error.
 //
 // Specifically it returns true for:
-//   - MQRC_CONNECTION_BROKEN     (2009)
-//   - MQRC_Q_MGR_NOT_AVAILABLE   (2059)
-//   - MQRC_Q_MGR_QUIESCING       (2161)
-//   - MQRC_Q_MGR_STOPPING        (2162)
-//   - MQRC_CONNECTION_QUIESCING  (2202)
-//   - MQRC_CONNECTION_STOPPING   (2203)
+//   - MQRC_CONNECTION_BROKEN       (2009)
+//   - MQRC_HCONN_ERROR             (2018)
+//   - MQRC_Q_MGR_NOT_AVAILABLE     (2059)
+//   - MQRC_Q_MGR_QUIESCING         (2161)
+//   - MQRC_Q_MGR_STOPPING          (2162)
+//   - MQRC_CONNECTION_QUIESCING    (2202)
+//   - MQRC_CONNECTION_STOPPING     (2203)
+//   - MQRC_Q_MGR_NOT_ACTIVE        (2223)
+//   - MQRC_CONNECTION_ERROR        (2273)
+//   - MQRC_CONNECTION_SUSPENDED    (2521)
+//   - MQRC_CONNECTION_STOPPED      (2528)
 func IsConnectionError(err error) bool {
 	var mqRet *ibmmq.MQReturn
 	if !errors.As(err, &mqRet) {
@@ -167,11 +227,16 @@ func IsConnectionError(err error) bool {
 	}
 	switch mqRet.MQRC {
 	case ibmmq.MQRC_CONNECTION_BROKEN,
+		ibmmq.MQRC_HCONN_ERROR,
 		ibmmq.MQRC_Q_MGR_NOT_AVAILABLE,
 		ibmmq.MQRC_Q_MGR_QUIESCING,
 		ibmmq.MQRC_Q_MGR_STOPPING,
 		ibmmq.MQRC_CONNECTION_QUIESCING,
-		ibmmq.MQRC_CONNECTION_STOPPING:
+		ibmmq.MQRC_CONNECTION_STOPPING,
+		ibmmq.MQRC_Q_MGR_NOT_ACTIVE,
+		ibmmq.MQRC_CONNECTION_ERROR,
+		ibmmq.MQRC_CONNECTION_SUSPENDED,
+		ibmmq.MQRC_CONNECTION_STOPPED:
 		return true
 	}
 	return false
@@ -179,33 +244,46 @@ func IsConnectionError(err error) bool {
 
 // Reconnect attempts to re-establish the IBM MQ connection using exponential backoff.
 //
-// It transitions the connection to [StateReconnecting], then retries up to
-// Config.MaxRetries times with a delay of BackoffDuration(InitialRetryInterval,
-// RetryMultiplier, attempt) before each dial attempt.
+// It transitions the connection to [StateReconnecting], dials immediately, then
+// retries up to Config.MaxRetries times with a capped delay between attempts.
 // On success it returns nil and the connection is in [StateConnected].
-// When all retries are exhausted it returns an error wrapping [ErrConnectionFailed]
-// and the connection is in [StateFailed].
-//
-// The error returned on permanent failure never contains credential values.
-func (c *connection) Reconnect() error {
+// If ctx is cancelled it returns ctx.Err(). When all retries are exhausted it
+// returns an error wrapping [ErrConnectionFailed] and the connection is in
+// [StateFailed]. The error never contains credential values.
+func (c *connection) Reconnect(ctx context.Context) error {
 	c.setState(StateReconnecting)
 
 	cfg := c.config
+	attempts := cfg.MaxRetries
+	if attempts < 1 {
+		attempts = 1
+	}
 
-	for attempt := range cfg.MaxRetries {
+	var lastErr error
+	for attempt := range attempts {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+
 		// Disconnect cleanly if we still have a handle before retrying.
 		_ = c.queueManager.Disc()
 
-		sleepWithJitter(BackoffDuration(cfg.InitialRetryInterval, cfg.RetryMultiplier, attempt))
-
 		if err := c.dial(); err == nil {
 			return nil
+		} else {
+			lastErr = err
+		}
+
+		if attempt < attempts-1 {
+			if err := sleepWithJitterCtx(ctx, retryDelay(cfg, attempt)); err != nil {
+				return err
+			}
 		}
 	}
 
 	c.setState(StateFailed)
-	return fmt.Errorf("%w: queue manager %q exhausted %d reconnect attempts",
-		ErrConnectionFailed, cfg.QueueManagerName, cfg.MaxRetries)
+	return fmt.Errorf("%w: queue manager %q exhausted %d reconnect attempts: %w",
+		ErrConnectionFailed, cfg.QueueManagerName, attempts, lastErr)
 }
 
 // IsEmptyQueueError reports whether err is MQRC_NO_MSG_AVAILABLE (2033),

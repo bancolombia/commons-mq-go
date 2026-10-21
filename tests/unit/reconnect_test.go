@@ -162,6 +162,53 @@ func TestReconnect_ErrConnectionFailed_IsSentinel(t *testing.T) {
 		"ErrConnectionFailed must be an errors.Is-comparable sentinel")
 }
 
+// TestReconnect_InitialConnect_ContextCancelled_ReturnsPromptly verifies that
+// the initial connection retry loop honors context cancellation instead of
+// sleeping out the full backoff.
+func TestReconnect_InitialConnect_ContextCancelled_ReturnsPromptly(t *testing.T) {
+	cfg := mq.Config{
+		QueueManagerName:     "QM1",
+		ConnectionName:       "localhost(19999)", // nothing listening
+		ChannelName:          "DEV.APP.SVRCONN",
+		MaxRetries:           10,
+		InitialRetryInterval: 10 * time.Second,
+		RetryMultiplier:      1.0,
+		MaxRetryInterval:     10 * time.Second,
+	}
+	client, err := mq.NewClient(cfg)
+	require.NoError(t, err)
+	defer client.Close()
+
+	l := client.NewListener("DEV.QUEUE.1")
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	start := time.Now()
+	err = l.Start(ctx, func(_ context.Context, _ *mq.Message) error { return nil })
+	elapsed := time.Since(start)
+
+	assert.NoError(t, err, "cancelled listener shutdown is a clean stop")
+	assert.Less(t, elapsed, 2*time.Second,
+		"Start must stop promptly when the context is cancelled during connect retries")
+}
+
+// TestSender_SendAfterClose_ReturnsErrClientClosed verifies that a closed
+// Sender fails fast instead of dialing new connections or blocking on the pool.
+func TestSender_SendAfterClose_ReturnsErrClientClosed(t *testing.T) {
+	client, err := mq.NewClient(mq.Config{
+		QueueManagerName: "QM1",
+		ConnectionName:   "localhost(19999)",
+		ChannelName:      "DEV.APP.SVRCONN",
+	})
+	require.NoError(t, err)
+
+	s := client.NewSender("DEV.QUEUE.1")
+	require.NoError(t, client.Close())
+
+	_, err = s.Send(context.Background(), "payload")
+	assert.ErrorIs(t, err, mq.ErrClientClosed)
+}
+
 // TestBackoffDuration_ZeroAttempt_NoPanic verifies no panic on attempt=0.
 func TestBackoffDuration_ZeroAttempt_NoPanic(t *testing.T) {
 	assert.NotPanics(t, func() {

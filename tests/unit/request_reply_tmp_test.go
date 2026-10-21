@@ -58,6 +58,20 @@ func TestClientClose_WithRequestReplyClient_NoError(t *testing.T) {
 	assert.NoError(t, client.Close())
 }
 
+// TestRequestReply_AfterClose_ReturnsErrClientClosed verifies that a closed
+// request-reply client fails fast instead of dialing.
+func TestRequestReply_AfterClose_ReturnsErrClientClosed(t *testing.T) {
+	client, err := mq.NewClient(validRRConfig())
+	require.NoError(t, err)
+	defer client.Close()
+
+	rr := client.NewRequestReplyClient("DEV.QUEUE.1")
+	require.NoError(t, rr.Close())
+
+	_, err = rr.RequestReply(context.Background(), "ping", time.Second)
+	assert.ErrorIs(t, err, mq.ErrClientClosed)
+}
+
 // ── RROption ─────────────────────────────────────────────────────────────────
 
 // TestRROption_WithRRReplyQueue_Accepted verifies WithRRReplyQueue does not panic.

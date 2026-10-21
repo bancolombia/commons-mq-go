@@ -3,6 +3,7 @@ package unit_test
 import (
 	"context"
 	"testing"
+	"time"
 
 	"github.com/bancolombia/commons-mq-go/mq"
 	mqotel "github.com/bancolombia/commons-mq-go/otel"
@@ -54,10 +55,13 @@ func TestOTelNoOpPath_ExplicitNoopProviders(t *testing.T) {
 // checks that the OTel code-path doesn't explode before the MQ connection attempt).
 func TestOTelNoOpPath_SendDoesNotPanicWithoutMQ(t *testing.T) {
 	cfg := mq.Config{
-		QueueManagerName: "QM1",
-		ConnectionName:   "localhost(19999)", // unreachable — connection will fail
-		ChannelName:      "DEV.APP.SVRCONN",
-		MaxRetries:       0,
+		QueueManagerName:     "QM1",
+		ConnectionName:       "localhost(19999)", // unreachable — connection will fail
+		ChannelName:          "DEV.APP.SVRCONN",
+		MaxRetries:           1,
+		InitialRetryInterval: time.Millisecond,
+		RetryMultiplier:      1.0,
+		MaxRetryInterval:     time.Millisecond,
 	}
 	client, err := mq.NewClient(cfg)
 	require.NoError(t, err)

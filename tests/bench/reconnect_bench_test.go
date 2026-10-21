@@ -64,8 +64,8 @@ func startBenchMQContainerWithRef(tb testing.TB) (testcontainers.Container, stri
 	if err != nil {
 		tb.Fatalf("get port: %v", err)
 	}
-	tb.Logf("MQ container started with port %d", p.Int())
-	return ctr, h, p.Int()
+	tb.Logf("MQ container started with port %d", int(p.Num()))
+	return ctr, h, int(p.Num())
 }
 
 // BenchmarkReconnect_ListenerRecovery measures the time from outage detection to
@@ -138,9 +138,9 @@ func BenchmarkReconnect_ListenerRecovery(b *testing.B) {
 
 		newHost, _ := ctr.Host(context.Background())
 		newPort, _ := ctr.MappedPort(context.Background(), "1414/tcp")
-		b.Logf("MQ container restarted with host %s and port %d", newHost, newPort.Int())
+		b.Logf("MQ container restarted with host %s and port %d", newHost, int(newPort.Num()))
 
-		probeCfg := benchMQConfig(newHost, newPort.Int())
+		probeCfg := benchMQConfig(newHost, int(newPort.Num()))
 		probeClient, err := mq.NewClient(probeCfg)
 		if err == nil {
 			probeSender := probeClient.NewSender("DEV.QUEUE.1")

@@ -73,13 +73,13 @@ cfg := mq.Config{
 
 ```go
 ctx, cancel := context.WithCancel(context.Background())
+defer cancel()
 
 go func() {
     sigCh := make(chan os.Signal, 1)
     signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
     <-sigCh
-    cancel()          // stop all listeners
-    client.Close()    // drain sender pools
+    client.Close()    // cancels listeners, waits for in-flight work, drains sender pools
 }()
 
 listener.Start(ctx, handler) // blocks until cancel()
@@ -91,7 +91,7 @@ When building in CI or shipping a container image, use a multi-stage Dockerfile 
 
 ```dockerfile
 # ---- build stage ----
-FROM golang:1.22 AS builder
+FROM golang:1.25 AS builder
 
 # Provide the IBM MQ redistributable client (copy from a base image or ADD the tarball)
 COPY --from=ibm-mq-client /opt/mqm /opt/mqm
@@ -141,8 +141,10 @@ CGO_ENABLED=1 go build ./...
 ## Backoff formula
 
 ```
-delay(attempt) = initialRetryInterval × retryMultiplier ^ attempt
+delay(attempt) = min(initialRetryInterval × retryMultiplier ^ attempt, maxRetryInterval)
 ```
+
+`MaxRetryInterval` defaults to 30 seconds. Waits are context-aware: cancelling the caller's context stops an in-progress retry loop promptly.
 
 To configure aggressive retry for low-latency recovery:
 
@@ -157,6 +159,8 @@ cfg.MaxRetries           = 20
 ```go
 _, err := sender.Send(ctx, payload)
 switch {
+case errors.Is(err, mq.ErrClientClosed):
+    // shutdown in progress — stop producing
 case errors.Is(err, mq.ErrConnectionFailed):
     // permanent failure — circuit open, alert ops
 case err != nil:

@@ -23,6 +23,7 @@ import (
 )
 
 const (
+	mqImage        = "gabheadz/mq:9.4.5.0-arm64" //"icr.io/ibm-messaging/mq:latest"
 	mqPort         = "1414/tcp"
 	mqQueueManager = "QM1"
 	mqChannel      = "DEV.APP.SVRCONN"
@@ -41,7 +42,7 @@ func startMQContainer(t *testing.T) (host string, port int) {
 
 	img := os.Getenv("MQ_IMAGE_TAG")
 	if img == "" {
-		img = "ibm-mqadvanced-server-dev:9.4.5.0-arm64"
+		img = "gabheadz/mq:9.4.5.0-arm64"
 		t.Logf("integration test: using default MQ Image %s", img)
 	} else {
 		t.Logf("integration test: using external MQ Image configured via env 'MQ_IMAGE_TAG' : %s", img)
@@ -78,28 +79,14 @@ func startMQContainer(t *testing.T) (host string, port int) {
 	h, err := ctr.Host(ctx)
 	require.NoError(t, err)
 
-	return h, mappedPort.Int()
+	port = int(mappedPort.Num())
+	waitForMQReady(t, h, port)
+	return h, port
 }
 
-// mqConfig returns a Config pointing at the test MQ container.
-func mqConfig(host string, port int) mq.Config {
-	return mq.Config{
-		QueueManagerName:     mqQueueManager,
-		ConnectionName:       fmt.Sprintf("%s(%d)", host, port),
-		ChannelName:          mqChannel,
-		Username:             mqAppUser,
-		Password:             mqAppPassword,
-		InputConcurrency:     1,
-		MaxRetries:           3,
-		InitialRetryInterval: 500 * time.Millisecond,
-	}
-}
-
-// putMessage places a raw message on the named queue using a direct IBM MQ connection.
-// Used by integration tests to seed messages before starting a listener.
-func putMessage(t *testing.T, cfg mq.Config, queueName, payload string) {
-	t.Helper()
-
+// connectMQ opens an authenticated client connection to the test queue manager.
+// The caller is responsible for calling Disc on the returned handle.
+func connectMQ(cfg mq.Config) (ibmmq.MQQueueManager, error) {
 	mqcd := ibmmq.NewMQCD()
 	mqcd.ChannelName = cfg.ChannelName
 	mqcd.ConnectionName = cfg.ConnectionName
@@ -116,7 +103,55 @@ func putMessage(t *testing.T, cfg mq.Config, queueName, payload string) {
 		mqcno.SecurityParms = mqcsp
 	}
 
-	qmgr, err := ibmmq.Connx(cfg.QueueManagerName, mqcno)
+	return ibmmq.Connx(cfg.QueueManagerName, mqcno)
+}
+
+// waitForMQReady blocks until the queue manager accepts an authenticated client
+// connection. waiting for the listening port alone is not sufficient: Docker's
+// port proxy can accept TCP before the queue manager and its channels are ready,
+// which makes the first fail-fast dial (used by request-reply) flaky with
+// MQRC_HOST_NOT_AVAILABLE.
+func waitForMQReady(t *testing.T, host string, port int) {
+	t.Helper()
+
+	cfg := mqConfig(host, port)
+	deadline := time.Now().Add(90 * time.Second)
+	var lastErr error
+	for time.Now().Before(deadline) {
+		qmgr, err := connectMQ(cfg)
+		if err == nil {
+			_ = qmgr.Disc()
+			return
+		}
+		lastErr = err
+		time.Sleep(250 * time.Millisecond)
+	}
+	t.Fatalf("MQ queue manager did not accept client connections within 90s: %v", lastErr)
+}
+
+// mqConfig returns a Config pointing at the test MQ container.
+func mqConfig(host string, port int) mq.Config {
+	return mq.Config{
+		QueueManagerName: mqQueueManager,
+		ConnectionName:   fmt.Sprintf("%s(%d)", host, port),
+		ChannelName:      mqChannel,
+		Username:         mqAppUser,
+		Password:         mqAppPassword,
+		// The IBM MQ developer image grants the app user authority on
+		// DEV.APP.MODEL.QUEUE, not on SYSTEM.DEFAULT.MODEL.QUEUE.
+		ModelQueue:           "DEV.APP.MODEL.QUEUE",
+		InputConcurrency:     1,
+		MaxRetries:           3,
+		InitialRetryInterval: 500 * time.Millisecond,
+	}
+}
+
+// putMessage places a raw message on the named queue using a direct IBM MQ connection.
+// Used by integration tests to seed messages before starting a listener.
+func putMessage(t *testing.T, cfg mq.Config, queueName, payload string) {
+	t.Helper()
+
+	qmgr, err := connectMQ(cfg)
 	require.NoError(t, err, "putMessage: connect to QM")
 	defer qmgr.Disc()
 

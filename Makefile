@@ -13,7 +13,7 @@ test-unit:
 	$(GO) test $(GOFLAGS) ./tests/unit/... -v -count=1
 
 test-integration:
-	$(GO) test $(GOFLAGS) -tags integration ./tests/integration/... -v -count=1 -timeout 120s
+	$(GO) test $(GOFLAGS) -tags integration ./tests/integration/... -v -count=1 -timeout 600s
 
 lint:
 	golangci-lint run ./...

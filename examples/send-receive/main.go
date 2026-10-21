@@ -93,7 +93,7 @@ func main() {
 		log.Printf("[send] #%-2d  id=%.16s…  body=%s", i+1, msgID, payload)
 	}
 
-	// ── 4. Wait for all messages to be received, then shut down ──────────────
+	// ── 4. Wait for all messages to be received ──────────────────────────────
 	waitCh := make(chan struct{})
 	go func() {
 		allReceived.Wait()
@@ -102,23 +102,24 @@ func main() {
 
 	select {
 	case <-waitCh:
-		log.Printf("all %d messages received — shutting down", msgCount)
+		log.Printf("all %d messages received", msgCount)
 	case <-time.After(30 * time.Second):
 		log.Printf("timed out waiting for messages — received %d of %d", received.Load(), msgCount)
 	}
 
+	// ── 5. Health check while the listener is still running ──────────────────
+	status := client.Health()
+	log.Printf("health while consuming  healthy=%v", status.Healthy)
+	for _, d := range status.Details {
+		log.Printf("  connection  component=%s  alive=%v  reason=%s",
+			d.Component, d.Alive, d.Reason)
+	}
+
+	// ── 6. Shut down ─────────────────────────────────────────────────────────
 	cancel() // stop the listener
 
 	if err := <-listenerDone; err != nil {
 		log.Printf("listener exited with error: %v", err)
-	}
-
-	// ── 5. Health check ───────────────────────────────────────────────────────
-	status := client.Health()
-	log.Printf("final health  healthy=%v", status.Healthy)
-	for _, d := range status.Details {
-		log.Printf("  connection  queue-manager=%s  alive=%v  reason=%s",
-			d.QueueManager, d.Alive, d.Reason)
 	}
 }
 

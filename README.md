@@ -10,13 +10,14 @@ Go equivalent of the [`commons-jms`](https://github.com/bancolombia/commons-jms)
 - Message sender (`Sender`) with producer pool and TTL support
 - Request-reply via temporary queue (`RequestReplyClient`)
 - Request-reply via fixed queue with correlation ID selector (`RequestReplyClientFixed`)
-- Automatic reconnection with exponential backoff
-- Health check (`Client.Health()`) for liveness/readiness probes
+- Automatic reconnection with context-aware, capped exponential backoff
+- Health check (`Client.Health()`) for liveness/readiness probes, including per-consumer and permanent-failure states
+- Consumer error callback (`WithListenerErrorHandler`) and handler-error telemetry
 - Zero-overhead OpenTelemetry tracing and metrics (opt-in via `TelemetryConfig`)
 
 ## Requirements
 
-- Go 1.22+
+- Go 1.25+
 - CGO enabled (`CGO_ENABLED=1`, which is the default for native builds)
 - IBM MQ C client libraries installed at `/opt/mqm` (see [CGO & IBM MQ C Client](#cgo--ibm-mq-c-client) below)
 
@@ -76,7 +77,7 @@ For containerised builds that ship the IBM MQ libraries alongside the binary:
 
 ```dockerfile
 # ---- build stage ----
-FROM golang:1.22 AS builder
+FROM golang:1.25 AS builder
 
 # Copy IBM MQ redistributable client (pre-extracted)
 COPY --from=ibm-mq-client /opt/mqm /opt/mqm
@@ -150,6 +151,8 @@ func main() {
         Password:         "passw0rd",
         InputQueue:       "DEV.QUEUE.1",
         InputConcurrency: 3,
+        // Required for temporary reply queues with the IBM MQ developer image.
+        ModelQueue: "DEV.APP.MODEL.QUEUE",
     })
     if err != nil {
         log.Fatal(err)
@@ -180,7 +183,7 @@ log.Printf("sent message ID: %s", msgID)
 ### 5. Request-Reply (temporary queue)
 
 ```go
-rr := client.NewRequestReplyClient("DEV.QUEUE.REQUEST")
+rr := client.NewRequestReplyClient("DEV.QUEUE.1")
 response, err := rr.RequestReply(context.Background(), "ping", 10*time.Second)
 if err != nil {
     log.Fatal(err)
@@ -208,7 +211,7 @@ When `Telemetry` is nil (default), no OTel code runs — zero overhead.
 status := client.Health()
 if !status.Healthy {
     for _, c := range status.Details {
-        log.Printf("connection %s: %s", c.QueueManager, c.Reason)
+        log.Printf("%s (%s): %s", c.Component, c.QueueManager, c.Reason)
     }
 }
 ```

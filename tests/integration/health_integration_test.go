@@ -59,9 +59,9 @@ func TestHealth_Healthy_WhileConnected(t *testing.T) {
 	}
 }
 
-// TestHealth_Unhealthy_AfterConnectionClosed verifies that Health() reports
-// unhealthy when the underlying connection has been forced into StateFailed.
-// We simulate this by creating a client pointing at a non-existent host.
+// TestHealth_Unhealthy_WhenConnectionNeverEstablished verifies that a Sender
+// whose connection attempts fail keeps reporting unhealthy even though no
+// connection remains allocated.
 func TestHealth_Unhealthy_WhenConnectionNeverEstablished(t *testing.T) {
 	cfg := mq.Config{
 		QueueManagerName:     "QM1",
@@ -69,24 +69,22 @@ func TestHealth_Unhealthy_WhenConnectionNeverEstablished(t *testing.T) {
 		ChannelName:          "DEV.APP.SVRCONN",
 		Username:             "app",
 		Password:             "passw0rd",
-		MaxRetries:           0,
+		MaxRetries:           1,
 		InitialRetryInterval: 1 * time.Millisecond,
+		RetryMultiplier:      1.0,
+		MaxRetryInterval:     time.Millisecond,
 	}
 	client, err := mq.NewClient(cfg)
 	require.NoError(t, err)
 	defer client.Close()
 
-	// Create a Sender and try to send — this will fail and mark the connection as failed.
 	sender := client.NewSender("DEV.QUEUE.1")
 	_, sendErr := sender.Send(context.Background(), "test")
-	assert.Error(t, sendErr, "expected send to fail on unreachable host")
+	require.Error(t, sendErr, "expected send to fail on unreachable host")
 
-	// After the failed send, health should reflect the failure.
-	// (The sender pool may be empty if connection creation failed before pool entry.)
 	h := client.Health()
-	// Either the pool is empty (no details) and healthy=true, or the failure is captured.
-	// Both are valid outcomes depending on whether the connection made it into the pool.
-	// The important invariant is that Health() does not panic.
-	assert.NotPanics(t, func() { _ = client.Health() })
-	t.Logf("Health after failed send: Healthy=%v, Details=%v", h.Healthy, h.Details)
+	assert.False(t, h.Healthy, "health must reflect the failed connection")
+	require.NotEmpty(t, h.Details, "the failed sender must appear in the details")
+	assert.False(t, h.Details[0].Alive)
+	assert.Contains(t, h.Details[0].Reason, "failed")
 }

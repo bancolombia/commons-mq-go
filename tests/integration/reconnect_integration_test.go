@@ -8,22 +8,47 @@ package integration_test
 import (
 	"context"
 	"errors"
+	"net"
+	"net/netip"
+	"strconv"
 	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/bancolombia/commons-mq-go/mq"
+	"github.com/moby/moby/api/types/container"
+	"github.com/moby/moby/api/types/network"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	testcontainers "github.com/testcontainers/testcontainers-go"
 	"github.com/testcontainers/testcontainers-go/wait"
 )
 
+// pickFreeHostPort returns a currently unused TCP port on the host. There is a
+// small race between closing the listener and Docker binding the port, which is
+// acceptable in tests.
+func pickFreeHostPort(t *testing.T) int {
+	t.Helper()
+	l, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	port := l.Addr().(*net.TCPAddr).Port
+	require.NoError(t, l.Close())
+	return port
+}
+
 // startMQContainerWithRef starts an IBM MQ container and returns both the host/port
 // AND the container reference so the test can stop/restart it.
 func startMQContainerWithRef(t *testing.T) (testcontainers.Container, string, int) {
 	t.Helper()
 	ctx := context.Background()
+
+	// Pin the host port: Docker assigns a new ephemeral host port every time a
+	// container is restarted, but a client's ConnectionName is fixed, so the
+	// listener can only reconnect if host:port stays stable across stop/start.
+	hostPort := pickFreeHostPort(t)
+	containerPort, err := network.ParsePort(mqPort)
+	require.NoError(t, err)
+	anyHost := netip.MustParseAddr("0.0.0.0")
 
 	ctr, err := testcontainers.Run(
 		ctx,
@@ -34,6 +59,13 @@ func startMQContainerWithRef(t *testing.T) (testcontainers.Container, string, in
 			"MQ_APP_PASSWORD": mqAppPassword,
 		}),
 		testcontainers.WithExposedPorts(mqPort),
+		testcontainers.WithHostConfigModifier(func(hc *container.HostConfig) {
+			hc.PortBindings = network.PortMap{
+				containerPort: []network.PortBinding{
+					{HostIP: anyHost, HostPort: strconv.Itoa(hostPort)},
+				},
+			}
+		}),
 		testcontainers.WithWaitStrategy(
 			wait.ForListeningPort(mqPort).WithStartupTimeout(120*time.Second),
 		),
@@ -49,7 +81,9 @@ func startMQContainerWithRef(t *testing.T) (testcontainers.Container, string, in
 	host, err := ctr.Host(ctx)
 	require.NoError(t, err)
 
-	return ctr, host, mappedPort.Int()
+	port := int(mappedPort.Num())
+	waitForMQReady(t, host, port)
+	return ctr, host, port
 }
 
 // T048: Consumer resumes message delivery after IBM MQ container stop/restart.
@@ -108,7 +142,7 @@ func TestReconnect_Integration_ListenerResumesAfterContainerRestart(t *testing.T
 	require.NoError(t, err)
 	h, err := ctr.Host(context.Background())
 	require.NoError(t, err)
-	newCfg := mqConfig(h, newPort.Int())
+	newCfg := mqConfig(h, int(newPort.Num()))
 
 	// Send a message via a fresh client (old port may have changed).
 	freshClient, err := mq.NewClient(newCfg)
